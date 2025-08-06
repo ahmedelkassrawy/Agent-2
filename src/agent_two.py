@@ -20,7 +20,7 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
-from src.models.rag_module import RAGModule
+from src.models.rag_model import RAGModule
 from langgraph.checkpoint.memory import MemorySaver
 
 # Disable warnings
