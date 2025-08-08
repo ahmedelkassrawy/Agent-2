@@ -1,0 +1,23 @@
+model_list:
+  - model_name: "groq-gemma9b"
+    litellm_params:
+      model: "groq/gemma2-9b-it"
+      api_key: "os.environ/GROQ_API_KEY"
+  - model_name: "groq-mixtral"
+    litellm_params:
+      model: "groq/mixtral-8x7b-32768"
+      api_key: "os.environ/GROQ_API_KEY"
+  - model_name: "gemini-1.5-flash"
+    litellm_params:
+      model: "gemini/gemini-1.5-flash"
+      api_key: "os.environ/GOOGLE_API_KEY"
+
+routing_strategy: simple-shuffle
+litellm_settings:
+  num_retries: 3
+  fallbacks: [{"groq-gemma9b": "groq-mixtral"}]
+  request_timeout: 10
+  allowed_fails: 3
+  cooldown_time: 30
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]

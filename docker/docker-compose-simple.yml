@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: agent2-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - agent2-network
+
+  # Optional: MongoDB Express for web UI (no auth required)
+  mongo-express:
+    image: mongo-express:latest
+    container_name: agent2-mongo-express
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_URL: mongodb://mongodb:27017/
+      ME_CONFIG_BASICAUTH: false
+    depends_on:
+      - mongodb
+    networks:
+      - agent2-network
+
+volumes:
+  mongodb_data:
+
+networks:
+  agent2-network:
+    driver: bridge

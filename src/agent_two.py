@@ -5,10 +5,10 @@ import langgraph
 from langgraph.graph import MessagesState, StateGraph, START, END
 import logging
 from typing import Literal, Optional, List, Any
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage
 import os
 import warnings
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+import requests
 from langchain_core.output_parsers import StrOutputParser
 
 # RAG-related imports
@@ -20,15 +20,111 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
-from src.models.rag_model import RAGModule
-from langgraph.checkpoint.memory import MemorySaver
+from models.rag_model import RAGModule
+from models.mongo_memory import SimpleMongoMemory
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain_community.chat_models import ChatLiteLLM
 
 # Disable warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["LANGCHAIN_TRACING_V2"] = "false"
 os.environ["LANGCHAIN_API_KEY"] = ""
 
-os.environ["GOOGLE_API_KEY"] = "AIzaSyB9o34YFREb_JLj7nXdfNwHfu5Pw9M-Hpw"
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+os.environ["LANGFUSE_PUBLIC_KEY"] ="pk-lf-27f7fa53-b370-46d2-82f0-6f32851dfc92"
+os.environ["LANGFUSE_SECRET_KEY"]="sk-lf-c3571355-5d0c-48bb-ac92-c3dfaecea1c2"
+os.environ["LANGFUSE_HOST"]="https://cloud.langfuse.com"
+
+# Set API keys from environment variables
+google_api_key = os.getenv("GOOGLE_API_KEY")
+groq_api_key = os.getenv("GROQ_API_KEY")
+
+if google_api_key:
+    os.environ["GOOGLE_API_KEY"] = google_api_key
+if groq_api_key:
+    os.environ["GROQ_API_KEY"] = groq_api_key
+
+# LLM Configuration with Proxy Support
+def setup_llm():
+    """
+    Setup LLM with proxy support. Uses LiteLLM proxy if configured,
+    otherwise falls back to direct API calls.
+    """
+    use_proxy = os.getenv('USE_LLM_PROXY', 'false').lower() == 'true'
+    proxy_url = os.getenv('LLM_PROXY_URL', 'http://localhost:4000')
+    
+    if use_proxy:
+        try:
+            response = requests.get(f"{proxy_url}/health", timeout=5)
+
+            if response.status_code == 200:
+                print("🔗 Using LiteLLM Proxy connection")
+                return ChatLiteLLM(
+                    model="groq-gemma9b",  # Primary model from proxy
+                    api_base=proxy_url,
+                    temperature=0.7,
+                    max_tokens=1000
+                )
+            else:
+                print("⚠️  Proxy not responding, falling back to direct API")
+        except Exception as e:
+            print(f"⚠️  Proxy connection failed: {e}, falling back to direct API")
+    
+    
+    print("🔗 Using direct API connection")
+    google_key = os.getenv("GOOGLE_API_KEY")
+    groq_key = os.getenv("GROQ_API_KEY")
+    
+    if not google_key or not groq_key:
+        raise ValueError("Missing required API keys. Please set GOOGLE_API_KEY and GROQ_API_KEY environment variables.")
+    
+    os.environ["GOOGLE_API_KEY"] = google_key
+    os.environ["GROQ_API_KEY"] = groq_key
+    os.environ["GROQ_API_KEY"] = groq_key
+    
+    try:
+        print("🔄 Attempting Gemini model...")
+        llm = ChatLiteLLM(
+            model="gemini/gemini-1.5-flash",
+            temperature=0.7,
+            max_tokens=1000
+        )
+        
+        test_response = llm.invoke("Hello")
+        print("✅ Gemini model initialized successfully")
+        return llm
+    except Exception as e:
+        print(f"⚠️  Gemini failed: {str(e)[:100]}...")
+        print("🔄 Attempting Groq model...")
+        try:
+            llm = ChatLiteLLM(
+                model="groq/llama3-8b-8192",  
+                temperature=0.7,
+                max_tokens=1000
+            )
+            
+            test_response = llm.invoke("Hello")
+            print("✅ Groq model initialized successfully")
+            return llm
+        except Exception as e2:
+            print(f"❌ Both models failed. Gemini: {str(e)[:50]}... | Groq: {str(e2)[:50]}...")
+            
+            return ChatLiteLLM(
+                model="gemini/gemini-1.5-flash", 
+                temperature=0.7,
+                max_tokens=1000
+            )
+
+
+llm = setup_llm()
+
+os.environ["COHERE_API_KEY"] = os.getenv("COHERE_API_KEY", "Up1yTRmr2bZ73o4fzSseBaonBJLaHBN9ZCeVh1xG")
+os.environ["LANGFUSE_PUBLIC_KEY"] = os.getenv("LANGFUSE_PUBLIC_KEY", "pk-lf-27f7fa53-b370-46d2-82f0-6f32851dfc92")
+os.environ["LANGFUSE_SECRET_KEY"] = os.getenv("LANGFUSE_SECRET_KEY", "sk-lf-c3571355-5d0c-48bb-ac92-c3dfaecea1c2")
+os.environ["LANGFUSE_HOST"] = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
 
 class State(MessagesState):
     question : Optional[str] = Field(default=None, description="The question to be answered by the agent.")
@@ -36,11 +132,7 @@ class State(MessagesState):
     doc_summary: str = Field(default="", description="The summary of the document.")
     query: Optional[str] = Field(default=None, description="The query to be sent to the RAG.")
     document_path: Optional[str] = Field(default=None, description="Path to the document for RAG.")
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0.2,
-)
+    user_id: Optional[str] = Field(default="user", description="User ID for accessing preferences.")
 
 @tool
 def rag_query_tool(question: str, 
@@ -52,12 +144,17 @@ def rag_query_tool(question: str,
     Args:
         question: The question to ask about the document
         document_path: Path to the document (PDF or text file)
-        model_name: The LLM model to use (default: gemini-2.5-flash)
+        model_name: The LLM model to use (default: gemini-1.5-flash)
     
     Returns:
         The answer based on the document content
     """
     try:
+        # Use proxy-aware model name if proxy is enabled
+        use_proxy = os.getenv('USE_LLM_PROXY', 'false').lower() == 'true'
+        if use_proxy:
+            model_name = "groq-gemma9b"  # Use proxy model
+        
         rag = RAGModule(
             model_name=model_name,
             embeddings_model="sentence-transformers/all-mpnet-base-v2",
@@ -106,13 +203,13 @@ def summarize_doc(document_path: str) -> str:
         return "No document path provided."
     
     try:
-        # Read the document content
+        # PDF Loading
         if document_path.endswith('.pdf'):
             loader = PyPDFLoader(document_path)
             docs = loader.load()
             content = "\n".join([doc.page_content for doc in docs])
         else:
-            # Assume it's a text file
+            # Text Loading
             with open(document_path, 'r', encoding='utf-8') as file:
                 content = file.read()
         
@@ -142,7 +239,6 @@ def route_request(state: dict) -> Literal["rag_query", "summarize_doc", "summari
     document_path = state.get("document_path", "")
     messages = state.get("messages", [])
     
-    # Create a prompt for the LLM to decide routing
     routing_prompt = f"""
     You are a routing assistant that determines which tool should handle a user's request.
     
@@ -168,12 +264,7 @@ def route_request(state: dict) -> Literal["rag_query", "summarize_doc", "summari
     
     try:
         # Use LLM to determine routing
-        response = llm.invoke(
-            [
-                {"role": "user",
-                "content": routing_prompt}
-            ]
-        )
+        response = llm.invoke([HumanMessage(content=routing_prompt)])
         route = response.content.strip().lower()
         
         valid_routes = ["rag_query", 
@@ -207,16 +298,27 @@ def route_request(state: dict) -> Literal["rag_query", "summarize_doc", "summari
             return "general_response"
 
 def rag_query_node(state: dict) -> dict:
-    """Node for handling RAG queries"""
+    """Node for handling RAG queries with user preferences"""
     try:
         question = state.get("question", "")
         document_path = state.get("document_path", "")
+        user_id = state.get("user_id", "user")
         
         if not document_path:
             ai_message = AIMessage(content="I would need a document to answer questions about it. Please provide a document path.")
         else:
+            # Get user preferences to customize RAG response
+            user_preferences = mongo_memory.get_user_preferences(user_id)
+            
+            # Modify question to include preference context if available
+            enhanced_question = question
+            
+            if user_preferences:
+                preference_context = f"User preferences: {user_preferences}. "
+                enhanced_question = f"{preference_context} Please consider these preferences when answering: {question}"
+            
             answer = rag_query_tool.invoke({
-                "question": question,
+                "question": enhanced_question,
                 "document_path": document_path
             })
             ai_message = AIMessage(content=answer)
@@ -287,7 +389,6 @@ def summarize_chat_node(state: dict) -> dict:
             summary = summary_chain.invoke({"conversation": conversation_text})
             ai_message = AIMessage(content=f"Conversation Summary: {summary}")
         
-        # Ensure messages list exists
         if "messages" not in state:
             state["messages"] = []
         state["messages"].append(ai_message)
@@ -301,17 +402,57 @@ def summarize_chat_node(state: dict) -> dict:
     return state
 
 def general_response_node(state: dict) -> dict:
-    """Node for handling general responses using LLM"""
+    """Node for handling general responses using LLM with user preferences"""
     try:
         question = state.get("question", "")
+        user_id = state.get("user_id", "user") 
+
+        # User preferences
+        user_preferences = mongo_memory.get_user_preferences(user_id)
         
-        # Use LLM for general responses
-        response = llm.invoke(
-            [
-                {"role": "user", 
-                "content": question}
+        if user_preferences:
+            preference_text = "\n".join([f"- {key}: {value}" for key, value in user_preferences.items()])
+            system_prompt = f"""You are a helpful AI assistant. Please consider the user's preferences when responding:
+
+                            User Preferences:
+                            {preference_text}
+
+                            Please tailor your response to align with these preferences when relevant. For example:
+                            - If the user prefers a certain programming language, suggest solutions in that language
+                            - If the user has a preferred communication style, match that tone
+                            - If the user has specific interests, relate your answers to those interests when possible
+
+                            User Question: {question}
+
+                            Provide a helpful response that takes into account the user's preferences where applicable."""
+        else:
+            system_prompt = f"""You are a helpful AI assistant.
+
+                            User Question: {question}
+
+                            Provide a helpful response."""
+        
+        # Use LLM for general responses with preferences context        
+        if user_preferences:
+            preference_text = "\n".join([f"- {key}: {value}" for key, value in user_preferences.items()])
+            system_content = f"""You are a helpful AI assistant. Please consider the user's preferences when responding:
+
+                                User Preferences:
+                                {preference_text}
+
+                                Please tailor your response to align with these preferences when relevant. For example:
+                                - If the user prefers a certain programming language, suggest solutions in that language
+                                - If the user has a preferred communication style, match that tone
+                                - If the user has specific interests, relate your answers to those interests when possible"""
+            
+            messages = [
+                SystemMessage(content=system_content),
+                HumanMessage(content=question)
             ]
-        )
+        else:
+            messages = [HumanMessage(content=question)]
+        
+        response = llm.invoke(messages)
         ai_message = AIMessage(content=response.content)
         
         # Ensure messages list exists
@@ -320,7 +461,30 @@ def general_response_node(state: dict) -> dict:
         state["messages"].append(ai_message)
         
     except Exception as e:
-        error_message = AIMessage(content=f"Error processing request: {str(e)}")
+        error_str = str(e)
+        if "API key not valid" in error_str or "INVALID_ARGUMENT" in error_str:
+            error_message = AIMessage(content=f"""❌ API Key Error: The configured API key is invalid or expired.
+
+                                                    Possible solutions:
+                                                    1. Check your .env file and ensure GOOGLE_API_KEY or GROQ_API_KEY are set correctly
+                                                    2. Get a new API key from:
+                                                    - Google AI Studio: https://aistudio.google.com/app/apikey
+                                                    - Groq: https://console.groq.com/keys
+                                                    3. Set the environment variable: export GOOGLE_API_KEY="your-key-here"
+
+                                                    Technical error: {error_str[:200]}...""")
+        elif "litellm.AuthenticationError" in error_str:
+            error_message = AIMessage(content=f"""🔑 Authentication Error: Unable to authenticate with the AI service.
+
+                                                Please verify your API keys are:
+                                                1. Valid and not expired
+                                                2. Have sufficient credits/quota
+                                                3. Are set correctly in environment variables
+
+                                                Error details: {error_str[:200]}...""")
+        else:
+            error_message = AIMessage(content=f"Error processing request: {str(e)}")
+        
         if "messages" not in state:
             state["messages"] = []
         state["messages"].append(error_message)
@@ -328,7 +492,6 @@ def general_response_node(state: dict) -> dict:
     return state
 
 workflow = StateGraph(State)
-
 
 workflow.add_node("rag_query", rag_query_node)
 workflow.add_node("summarize_doc", summarize_doc_node)
@@ -352,47 +515,151 @@ workflow.add_edge("summarize_doc", END)
 workflow.add_edge("summarize_chat", END)
 workflow.add_edge("general_response", END)
 
-memory = MemorySaver()
-app = workflow.compile(checkpointer=memory)
+mongo_memory = SimpleMongoMemory(
+    connection_string="mongodb://localhost:27017/",
+    database_name="agent_memory"
+)
 
-conversation_history = []
+checkpointer = InMemorySaver()
+app = workflow.compile(checkpointer=checkpointer)
 
-while True:
-    try:
-        config = {"configurable":{"thread_id" : "1"}}
-        question = input("Enter your question (or 'exit' to quit): ").strip()
-        
-        if question.lower() == "exit":
+def print_memory_stats():
+    stats = mongo_memory.get_memory_stats()
+    print("\n=== Long Memory Stats ===")
+    print(f"Users with preferences: {stats.get('long_memory_users', 0)}")
+    print(f"Memory type: {stats.get('memory_type', 'unknown')}")
+    print("========================\n")
+
+def print_agent_config():
+    """Print current agent configuration"""
+    use_proxy = os.getenv('USE_LLM_PROXY', 'false').lower() == 'true'
+    proxy_url = os.getenv('LLM_PROXY_URL', 'http://localhost:4000')
+    
+    print("\n🚀 Agent Two - Enhanced Configuration")
+    print("=====================================")
+    print("Configuration:")
+    if use_proxy:
+        print("  • LLM Mode: 🔗 Proxy")
+        print(f"  • Proxy URL: {proxy_url}")
+        print("  • Primary Model: groq-gemma9b")
+        print("  • Fallback: groq-mixtral, gemini-1.5-flash")
+    else:
+        print("  • LLM Mode: 🔗 Direct API")
+        print("  • Model: gemini/gemini-1.5-flash (fallback: groq/llama3-8b-8192)")
+    
+    print("  • Memory: MongoDB + InMemory")
+    print("  • RAG: HuggingFace Embeddings + Chroma")
+    print("  • Features: PDF Processing, User Preferences")
+    print("=====================================\n")
+
+def save_user_preference(user_id: str, key: str, value: Any):
+    mongo_memory.save_user_preference(user_id, key, value)
+
+def get_user_preference(user_id: str, key: str, default: Any = None) -> Any:
+    return mongo_memory.get_user_preference(user_id, key, default)
+
+def main():
+    """Main interactive function"""
+    # Display configuration
+    print_agent_config()
+    
+    # Get thread ID from user or use default
+    print("Welcome to Agent-2 with Long Memory Only & Personalized AI!")
+    print("Commands:")
+    print("  - Type your questions normally (AI will consider your preferences)")
+    print("  - Type 'stats' to see memory statistics")
+    print("  - Type 'config' to see current configuration")
+    print("  - Type 'profile <key> <value>' to set preferences that guide AI responses")
+    print("  - Type 'myprofile' to see your current preferences")
+    print("  - Type 'exit' to quit")
+    print("\nPersonalization Examples:")
+    print("  profile language python       # AI will suggest Python solutions")
+    print("  profile tone friendly         # AI will use a friendly tone")
+    print("  profile expertise beginner    # AI will explain things simply")
+    print("  profile interests 'AI, music' # AI will relate answers to your interests")
+
+    # Extract user_id for preferences
+    user_id = input("\nEnter your user ID (or press Enter for default 'user'): ").strip()
+
+    if not user_id:
+        user_id = "user"
+
+    print(f"Using user ID: {user_id}")
+
+
+    user_preferences = mongo_memory.get_user_preferences(user_id)
+
+    if user_preferences:
+        print(f"Loaded {len(user_preferences)} user preferences")
+        print(f"Welcome back! Your preferences: {user_preferences}")
+
+    while True:
+        try:
+            config = {"configurable": {"thread_id": f"session_{user_id}"}}
+            
+            user_input = input(f"\n[{user_id}] Enter your question: ").strip()
+            
+            if user_input.lower() == "exit":
+                break
+            elif user_input.lower() == "stats":
+                print_memory_stats()
+                continue
+            elif user_input.lower() == "config":
+                print_agent_config()
+                continue
+            elif user_input.lower() == "myprofile":
+                prefs = mongo_memory.get_user_preferences(user_id)
+                if prefs:
+                    print(f"\nYour preferences:")
+                    for key, value in prefs.items():
+                        print(f"  {key}: {value}")
+                else:
+                    print("No preferences set yet.")
+                continue
+            elif user_input.startswith("profile "):
+                parts = user_input.split(" ", 2)
+                if len(parts) >= 3:
+                    key, value = parts[1], parts[2]
+                    save_user_preference(user_id, key, value)
+                    print(f"✓ Saved preference: {key} = {value}")
+                    print("This preference will be considered in future AI responses!")
+                else:
+                    print("Usage: profile <key> <value>")
+                    print("Examples:")
+                    print("  profile language python")
+                    print("  profile communication_style friendly")
+                    print("  profile interests 'AI, coding, music'")
+                    print("  profile tone casual")
+                continue
+                
+            document_path = input("Enter document path (or leave blank): ").strip()
+            
+            initial_state = {
+                "messages": [],  
+                "question": user_input,
+                "document_path": document_path if document_path else None,
+                "user_id": user_id  
+            }
+
+            res = app.invoke(initial_state, config=config)
+
+            if "messages" in res and res["messages"]:
+                # Get the last AI message from the result
+                latest_message = res["messages"][-1].content
+                print(f"\nAI Response: {latest_message}")
+            else:
+                print("No response from AI.")
+            
+        except KeyboardInterrupt:
+            print("\nExiting...")
             break
-            
-        document_path = input("Enter document path (or leave blank if not applicable): ").strip()
-        
-        # Add the current question to conversation history
-        conversation_history.append(HumanMessage(content=question))
-        
-        # Create initial state as dictionary (LangGraph converts internally)
-        initial_state = {
-            "messages": conversation_history.copy(),  # Use the persistent conversation history
-            "question": question,
-            "document_path": document_path if document_path else None
-        }
+        except Exception as e:
+            print(f"Error: {e}")
+            continue
 
-        res = app.invoke(initial_state, config=config)
+    # Cleanup
+    mongo_memory.close()
+    print("Goodbye!")
 
-        if "messages" in res and res["messages"]:
-            # Get the last AI message from the result
-            latest_message = res["messages"][-1].content
-            print(f"AI Response: {latest_message}")
-            
-            # Update conversation history with the AI response
-            # Check if we need to add the AI response (it might already be in conversation_history)
-            if not conversation_history or conversation_history[-1].content != latest_message:
-                conversation_history.append(AIMessage(content=latest_message))
-        else:
-            print("No response from AI.")
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        break
-
-
+if __name__ == "__main__":
+    main()
